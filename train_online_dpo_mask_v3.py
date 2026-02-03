@@ -7,7 +7,10 @@ import subprocess
 import tempfile
 import re
 import logging
+import random
+import itertools
 import time
+import json
 import gc
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -53,40 +56,40 @@ logger = logging.getLogger(__name__)
 #     ),
 # }
 
-# PROMPT_DICT = {
-#     "prompt_input": (
-#         "<|im_start|>system\n"
-#         "{system_prompt}<|im_end|>\n"
-#         "<|im_start|>user\n"
-#         "{instruction}\n\n"
-#         "{input}<|im_end|>\n"
-#         "<|im_start|>assistant\n"
-#     ),
-#     "prompt_no_input": (
-#         "<|im_start|>system\n"
-#         "{system_prompt}<|im_end|>\n"
-#         "<|im_start|>user\n"
-#         "{instruction}<|im_end|>\n"
-#         "<|im_start|>assistant\n"
-#     ),
-# }
-
 PROMPT_DICT = {
-        # 场景 A: 包含 instruction (题目) 和 input (具体输入/上下文)
-        "prompt_input": (
-            "@@ Instruction\n"
-            "{instruction}\n"
-            "{input}\n\n"
-            "@@ Response"
-        ),
+    "prompt_input": (
+        "<|im_start|>system\n"
+        "{system_prompt}<|im_end|>\n"
+        "<|im_start|>user\n"
+        "{instruction}\n\n"
+        "{input}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ),
+    "prompt_no_input": (
+        "<|im_start|>system\n"
+        "{system_prompt}<|im_end|>\n"
+        "<|im_start|>user\n"
+        "{instruction}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ),
+}
+
+# PROMPT_DICT = {
+#         # 场景 A: 包含 instruction (题目) 和 input (具体输入/上下文)
+#         "prompt_input": (
+#             "@@ Instruction\n"
+#             "{instruction}\n"
+#             "{input}\n\n"
+#             "@@ Response"
+#         ),
         
-        # 场景 B: 只包含 instruction (题目)
-        "prompt_no_input": (
-            "@@ Instruction\n"
-            "{instruction}\n"
-            "@@ Response"
-        ),
-    }
+#         # 场景 B: 只包含 instruction (题目)
+#         "prompt_no_input": (
+#             "@@ Instruction\n"
+#             "{instruction}\n"
+#             "@@ Response"
+#         ),
+#     }
 
 DEFAULT_SYSTEM_PROMPT = "You are an exceptionally intelligent coding assistant that consistently delivers accurate and reliable responses to user instructions."
 
@@ -95,6 +98,9 @@ class ScriptArguments:
     sft_model_path: str = field(metadata={"help": "SFT 模型路径"})
     data_path: str = field(metadata={"help": "训练数据路径 (JSON)"})
     output_dir: str = field(metadata={"help": "输出目录"})
+    
+    # === [新增] 在这里添加 max_pairs 参数 ===
+    max_pairs: int = field(default=2, metadata={"help": "每个Prompt最多构建几对DPO偏好数据 (影响显存)"})
     
     num_generations: int = field(default=4)
     temperature: float = field(default=0.8)
@@ -165,17 +171,31 @@ class CodeExecutor:
         except Exception: pass 
         return is_success, output_str
 
-    def batch_evaluate(self, gt_code: str, candidates: List[str], lang: str) -> Tuple[List[str], List[str]]:
+    def batch_evaluate(self, gt_code: str, candidates: List[str], lang: str) -> Tuple[List[str], List[str], List[str]]:
+        # 1. 先跑通 GT，获取标准输出
         gt_success, gt_stdout = self.run_code_sync(gt_code, lang)
-        if not gt_success: return [], []
-        with ThreadPoolExecutor(max_workers=len(candidates)) as executor:
+        if not gt_success:
+            # 如果 GT 都跑不通，理论上所有 candidates 都无法判定 Perfect
+            # 这里保守处理：全部视为 Failed，或者依赖 candidates 自身的运行状态
+            # 为简单起见，如果 GT 挂了，我们只区分 RunSuccess(Sync) 和 RunFail(Failed)
+            gt_stdout = "GT_FAILED_PLACEHOLDER"
+
+        with ThreadPoolExecutor(max_workers=min(len(candidates), 16)) as executor:
             futures = [executor.submit(self.run_code_sync, code, lang) for code in candidates]
             results = [f.result() for f in futures]
-        pass_list, fail_list = [], []
+        
+        perfects, syncs, faileds = [], [], []
+        
         for cand, (succ, out) in zip(candidates, results):
-            if succ and out.strip() == gt_stdout.strip(): pass_list.append(cand)
-            else: fail_list.append(cand)
-        return pass_list, fail_list
+            if succ:
+                if out.strip() == gt_stdout.strip():
+                    perfects.append(cand) # 运行成功 且 结果一致 -> Perfect
+                else:
+                    syncs.append(cand)    # 运行成功 但 结果不一致 -> Sync (Wrong Answer)
+            else:
+                faileds.append(cand)      # 运行失败 (编译错误/RuntimeError) -> Failed
+                
+        return perfects, syncs, faileds
 
 # ================= 模块 B: Mask 处理器 (保持不变) =================
 class MaskProcessor:
@@ -205,8 +225,8 @@ class MaskProcessor:
 
     def tokenize_and_mask(self, prompt: str, chosen: str, rejected: str):
         c_focus, r_focus = self.get_dual_diff_ranges(chosen, rejected)
-        c_enc = self.tokenizer(prompt + chosen, truncation=True, max_length=self.max_length, return_offsets_mapping=True, return_tensors='pt')
-        r_enc = self.tokenizer(prompt + rejected, truncation=True, max_length=self.max_length, return_offsets_mapping=True, return_tensors='pt')
+        c_enc = self.tokenizer(prompt + chosen, truncation=False, max_length=self.max_length, return_offsets_mapping=True, return_tensors='pt')
+        r_enc = self.tokenizer(prompt + rejected, truncation=False, max_length=self.max_length, return_offsets_mapping=True, return_tensors='pt')
         prompt_len = len(prompt)
         def apply_mask(enc, focus_ranges):
             input_ids = enc.input_ids[0]
@@ -383,15 +403,17 @@ def main():
         progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
         
         for batch_data in progress_bar:
-            # === Phase 1: Mining (生成) ===
-            instructions = batch_data['instruction']
-            inputs = batch_data['input']
-            outputs = batch_data['output']
+            # === Phase 1: Mining (生成 & 多重构造) ===
+            data_source = batch_data['data']
+            
+            instructions = data_source['instruction']
+            inputs = data_source['input']
+            outputs = data_source['gt_code']
             
             batch_input_ids, batch_labels, batch_masks = [], [], []
             mined_count = 0
             
-            # 清理显存以进行生成
+            # 清理显存
             torch.cuda.empty_cache() 
             
             for i, instr in enumerate(instructions):
@@ -402,81 +424,174 @@ def main():
                 if inp_data: prompt = PROMPT_DICT["prompt_input"].format(instruction=instr, input=inp_data, system_prompt=DEFAULT_SYSTEM_PROMPT)
                 else: prompt = PROMPT_DICT["prompt_no_input"].format(instruction=instr, system_prompt=DEFAULT_SYSTEM_PROMPT)
                 
+                # --- 1. 高效生成 (带分数) ---
                 with torch.no_grad():
                     inputs_tokenized = tokenizer(prompt, return_tensors="pt").to(accelerator.device)
-                    # 临时开启 Cache 加速生成
-                    gen_ids = accelerator.unwrap_model(model).generate(
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    
+                    # 开启 output_scores 直接拿 Logits，不需要后续再 Forward
+                    gen_out = unwrapped_model.generate(
                         **inputs_tokenized,
                         max_new_tokens=args.max_new_tokens,
                         do_sample=True,
                         temperature=args.temperature,
                         num_return_sequences=args.num_generations,
                         pad_token_id=tokenizer.pad_token_id,
-                        use_cache=True 
+                        eos_token_id=tokenizer.eos_token_id,
+                        use_cache=True,
+                        return_dict_in_generate=True,
+                        output_scores=True 
                     )
-                
-                gen_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-                candidates = []
-                for text in gen_texts:
-                    parts = text.split("### Response:")
-                    c = parts[1] if len(parts) > 1 else text
-                    c = re.sub(r'```[a-zA-Z]*', '', c).replace('```', '').strip()
-                    candidates.append(c)
-                
-                gt_code = re.sub(r'```[a-zA-Z]*', '', gt_code_raw).replace('```', '').strip()
-                passes, fails = executor_tool.batch_evaluate(gt_code, candidates, target_lang)
-                
-                if not fails: continue 
-                
-                # chosen = passes[0] if passes else gt_code
-                # rejected = max(fails, key=lambda x: difflib.SequenceMatcher(None, chosen, x).ratio())
-                # =================== MO-DPO: 分层质量评估筛选 ===================
-                chosen = None
-                
-                # [第一层] 基础正确性筛选 (Base Correctness)
-                if not passes:
-                    # 如果没有通过的代码，回退到 Ground Truth (Oracle Anchor)
-                    chosen = gt_code
-                elif len(passes) == 1:
-                    # 如果只有一个通过，直接选它
-                    chosen = passes[0]
-                else:
-                    # [第二层] 基于置信度的优选 (Confidence-based Anchor Selection)
-                    # 从通过的样本中，选择模型最“确信”的那一个
-                    best_score = -float('inf')
-                    best_candidate = passes[0]
-                    
-                    # 性能优化：如果通过的样本太多，为了不拖慢训练，只看前5个
-                    candidates_to_eval = passes
-                    
-                    for cand_code in candidates_to_eval:
-                        # 注意：prompt 变量必须是你当前上下文中 input prompt 的文本
-                        score = compute_model_confidence(
-                            model, 
-                            tokenizer, 
-                            prompt,  # 确保这里使用了当前数据的 prompt 字符串
-                            cand_code, 
-                            accelerator.device # 或者是 model.device
-                        )
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_candidate = cand_code
-                    
-                    chosen = best_candidate
+                    gen_ids = gen_out.sequences
+                    # 计算生成序列的 LogProbs
+                    transition_scores = unwrapped_model.compute_transition_scores(
+                        gen_out.sequences, gen_out.scores, normalize_logits=True
+                    )
 
-                # [对抗挖掘] 困难负样本构建 (Hard Negative Mining)
-                # 在所有失败样本中，找到与 chosen 编辑距离最近（最像）的那个
-                # ratio() 越高代表越相似，即编辑距离越小
-                rejected = max(fails, key=lambda x: difflib.SequenceMatcher(None, chosen, x).ratio())
-                # ==============================================================
-                if chosen == rejected: continue
+                # [修改 1] 解析时必须保留特殊 Token，否则无法识别 ChatML 标签
+                gen_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
                 
-                c_ids, c_mask, c_lbl, r_ids, r_mask, r_lbl = masker.tokenize_and_mask(prompt, chosen, rejected)
-                batch_input_ids.extend([c_ids, r_ids])
-                batch_masks.extend([c_mask, r_mask])
-                batch_labels.extend([c_lbl, r_lbl])
-                mined_count += 1
+                # 立即释放生成阶段的显存
+                del inputs_tokenized, gen_out
+                torch.cuda.empty_cache()
+
+                # --- 2. 解析代码与分数 ---
+                candidates_data = [] # 存 {'code': str, 'score': float}
+                for idx, text in enumerate(gen_texts):
+                    # [修改 2] 自动适配切分逻辑 (优先匹配 Qwen 的 ChatML)
+                    if "<|im_start|>assistant" in text:
+                        # Qwen 格式：取标签后的最后一部分（防止System Prompt里的干扰）
+                        c = text.split("<|im_start|>assistant")[-1]
+                    elif "@@ Response" in text: 
+                        # 旧格式 A
+                        c = text.split("@@ Response")[1]
+                    elif "### Response:" in text: 
+                        # 旧格式 B
+                        c = text.split("### Response:")[1]
+                    else: 
+                        # 兜底：假设全文都是生成的（或者格式不对）
+                        c = text
+                    
+                    # [修改 3] 清理 Qwen 的结束符 (Qwen 生成完往往带这个)
+                    c = c.replace("<|im_end|>", "").replace("<|endoftext|>", "")
+                    
+                    # 清理 Markdown 代码块标记
+                    c = re.sub(r'```[a-zA-Z]*', '', c).replace('```', '').strip()
+                    
+                    # 计算该序列的平均 log_prob
+                    # 排除 -inf (padding)
+                    valid_scores = transition_scores[idx][transition_scores[idx] > -65500]
+                    score = valid_scores.mean().item() if len(valid_scores) > 0 else -999.0
+                    
+                    candidates_data.append({"code": c, "score": score})
+
+                # 执行评测
+                candidates_strs = [d['code'] for d in candidates_data]
+                
+                # --- [Change 1] 调用新的三分类评测 ---
+                gt_code = re.sub(r'```[a-zA-Z]*', '', gt_code_raw).replace('```', '').strip()
+                perfects, syncs, faileds = executor_tool.batch_evaluate(gt_code, candidates_strs, target_lang)
+                if len(candidates_strs) > 0:
+                    if accelerator.is_local_main_process:
+                        rollout_dir = os.path.join(args.output_dir, "rollouts")
+                        os.makedirs(rollout_dir, exist_ok=True)
+                        
+                        debug_item = {
+                            "global_step": global_step,
+                            "instruction": instr,
+                            "input": inp_data,
+                            "target_lang": target_lang,
+                            "gt_code": gt_code,
+                            "candidates": candidates_strs,
+                            "perfects_count": len(perfects),
+                            "syncs_count": len(syncs),
+                            "faileds_count": len(faileds),
+                            # 记录具体的通过和失败代码，方便排查
+                            "perfects_samples": perfects[:1], # 只记一个节省空间
+                            "syncs_samples": syncs[:3],    # 记几个失败样例
+                            "faileds_samples": faileds[:3]
+                        }
+                        
+                        # 使用 JSON Lines 格式 (每行一个 JSON 对象)，避免追加写入导致 JSON 格式错误
+                        rollout_file = os.path.join(rollout_dir, f"epoch-{epoch}_rank{accelerator.process_index}.jsonl")
+                        with open(rollout_file, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(debug_item, ensure_ascii=False) + "\n")
+                            
+                logger.warning(f"Mining Failed for instruction: P: {len(perfects)}, S: {len(syncs)}, F: {len(faileds)}")
+                
+                # --- [Change 2] 组装各组别样本 (Set 去重) ---
+                # Perfect 组: 包含 GT 和所有生成的正确代码
+                group_perfect = set(perfects)
+                group_perfect.add(gt_code) # GT 永远是 perfect
+                
+                group_sync = set(syncs)
+                group_failed = set(faileds)
+                
+                # --- [Change 3] 按 N 采样/截断 ---
+                # 定义各组上限
+                LIMIT_PERFECT = 2
+                LIMIT_SYNC = 3
+                LIMIT_FAILED = 3
+                
+                # 辅助函数：转列表并随机截断
+                def sample_list(data_set, n):
+                    data_list = list(data_set)
+                    if len(data_list) > n:
+                        return random.sample(data_list, n)
+                    return data_list
+
+                samples_p = sample_list(group_perfect, LIMIT_PERFECT)
+                samples_s = sample_list(group_sync, LIMIT_SYNC)
+                samples_f = sample_list(group_failed, LIMIT_FAILED)
+                
+                # --- [Change 4] 构造笛卡尔积偏好对 ---
+                pairs_to_add = []
+                
+                # 策略 A: Perfect vs Sync (优化逻辑：让代码变正确)
+                # 笛卡尔积: {(p, s) for p in P for s in S}
+                if samples_p and samples_s:
+                    for p, s in itertools.product(samples_p, samples_s):
+                        pairs_to_add.append((p, s))
+                
+                # 策略 B: Sync vs Failed (优化语法：让代码能跑通)
+                # 笛卡尔积: {(s, f) for s in S for f in F}
+                if samples_s and samples_f:
+                    for s, f in itertools.product(samples_s, samples_f):
+                        pairs_to_add.append((s, f))
+                        
+                # 策略 C (兜底): Perfect vs Failed
+                # 如果中间层 Sync 是空的 (Sync Gap)，直接连接 P 和 F
+                # 否则链条会断裂，导致本条数据完全浪费
+                if not samples_s and samples_p and samples_f:
+                    for p, f in itertools.product(samples_p, samples_f):
+                        pairs_to_add.append((p, f))
+
+                # --- [Change 5] 将 Pairs 加入训练 Batch ---
+                # 注意：这里可能会产生很多对数据 (例如 2*3 + 3*3 = 15对)
+                # 务必使用 max_pairs 进行总量控制，防止 OOM
+                
+                current_pairs_added = 0
+                # 为了训练稳定性，可以先 shuffle 一下 pairs
+                random.shuffle(pairs_to_add)
+                
+                for c_str, r_str in pairs_to_add:
+                    # 使用 args.max_pairs 控制每个 Prompt 贡献的最大对数
+                    # 建议 args.max_pairs 设为 4 或 6，以容纳这种多对策略
+                    if current_pairs_added >= args.max_pairs: 
+                        break
+                    
+                    if c_str == r_str: continue
+                    
+                    c_ids, c_mask, c_lbl, r_ids, r_mask, r_lbl = masker.tokenize_and_mask(prompt, c_str, r_str)
+                    
+                    if len(c_ids) > args.max_length or len(r_ids) > args.max_length:
+                        continue
+                        
+                    batch_input_ids.extend([c_ids, r_ids])
+                    batch_masks.extend([c_mask, r_mask])
+                    batch_labels.extend([c_lbl, r_lbl])
+                    mined_count += 1
+                    current_pairs_added += 1
             
             # === Phase 2: Training (训练) ===
             torch.cuda.empty_cache()
