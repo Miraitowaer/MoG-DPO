@@ -56,21 +56,36 @@ logger = logging.getLogger(__name__)
 #     ),
 # }
 
+# PROMPT_DICT = {
+#     "prompt_input": (
+#         "<|im_start|>system\n"
+#         "{system_prompt}<|im_end|>\n"
+#         "<|im_start|>user\n"
+#         "{instruction}\n\n"
+#         "{input}<|im_end|>\n"
+#         "<|im_start|>assistant\n"
+#     ),
+#     "prompt_no_input": (
+#         "<|im_start|>system\n"
+#         "{system_prompt}<|im_end|>\n"
+#         "<|im_start|>user\n"
+#         "{instruction}<|im_end|>\n"
+#         "<|im_start|>assistant\n"
+#     ),
+# }
+
 PROMPT_DICT = {
     "prompt_input": (
-        "<|im_start|>system\n"
-        "{system_prompt}<|im_end|>\n"
-        "<|im_start|>user\n"
-        "{instruction}\n\n"
-        "{input}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "### Instruction:\n"
+        "{instruction}\n"
+        "{input}\n"
+        "### Response:"
     ),
+    
     "prompt_no_input": (
-        "<|im_start|>system\n"
-        "{system_prompt}<|im_end|>\n"
-        "<|im_start|>user\n"
-        "{instruction}<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "### Instruction:\n"
+        "{instruction}\n"
+        "### Response:"
     ),
 }
 
