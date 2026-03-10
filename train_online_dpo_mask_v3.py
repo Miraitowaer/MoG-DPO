@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 #         "{instruction}\n\n"
 #         "{input}<|im_end|>\n"
 #         "<|im_start|>assistant\n"
+#         "\n<think>\n</think>\n"
 #     ),
 #     "prompt_no_input": (
 #         "<|im_start|>system\n"
@@ -71,6 +72,7 @@ logger = logging.getLogger(__name__)
 #         "<|im_start|>user\n"
 #         "{instruction}<|im_end|>\n"
 #         "<|im_start|>assistant\n"
+#         "\n<think>\n</think>\n"
 #     ),
 # }
 
